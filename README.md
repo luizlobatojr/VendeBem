@@ -5,10 +5,11 @@ Aplicação desktop simples para Windows e Linux, feita com Python, Tkinter e SQ
 ## Funcionalidades
 - Editar quantidades no carrinho e aplicar desconto percentual antes de finalizar a venda.
 - Consultar o histórico com filtros por período, pagamento e artigo, e exportar os resultados em CSV.
-- Consultar detalhes de cada venda, incluindo anulações e descontos.
+- Consultar detalhes de cada venda, incluindo anulações e descontos; anular ou apagar uma venda selecionada no histórico.
 - Configurar o limite de stock baixo e filtrar a lista de artigos por esse limite.
 - Ver indicadores: vendas de hoje, número de vendas, artigos, unidades em stock e artigos com stock baixo.
 - Guardar os dados localmente numa base de dados SQLite, separada dos ficheiros do programa.
+- Abrir a janela principal centralizada, com tamanho inicial de 1120 × 720 píxeis (adaptado a ecrãs menores).
 
 ## Requisitos
 - Python 3.10 ou superior.
@@ -57,3 +58,5 @@ py -m PyInstaller --noconfirm --onefile --windowed --name GerenciadorDeVendas ap
 O executável será criado em `dist\GerenciadorDeVendas.exe`.
 
 **Nota:** a primeira inicialização após esta alteração pode migrar a base de dados existente. Mantenha uma cópia de segurança antes de atualizar.
+
+No histórico, selecione uma venda para a anular ou apagar. Apagar remove permanentemente o registo e os seus artigos do histórico, sem repor nem alterar o stock. Para manter o registo e repor o stock, use a opção de anulação.

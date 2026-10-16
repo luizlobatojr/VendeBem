@@ -11,6 +11,8 @@ from pathlib import Path
 
 APP_TITLE = "Gerenciador de Vendas"
 DB_FILENAME = "gerenciador_vendas.db"
+DEFAULT_WINDOW_WIDTH = 1120
+DEFAULT_WINDOW_HEIGHT = 720
 
 
 def user_data_directory():
@@ -275,6 +277,16 @@ class Database:
             )
         return canceled_at
 
+    def delete_sale(self, sale_id):
+        with self.conn:
+            sale = self.conn.execute(
+                "SELECT 1 FROM sales WHERE id=?", (sale_id,)
+            ).fetchone()
+            if sale is None:
+                raise ValueError("A venda selecionada não existe.")
+            self.conn.execute("DELETE FROM sale_items WHERE sale_id=?", (sale_id,))
+            self.conn.execute("DELETE FROM sales WHERE id=?", (sale_id,))
+
     def sale(self, sale_id):
         return self.conn.execute(
             "SELECT * FROM sales WHERE id=?", (sale_id,)
@@ -339,8 +351,14 @@ class SalesApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1120x720")
-        self.minsize(920, 600)
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        width = min(DEFAULT_WINDOW_WIDTH, screen_width)
+        height = min(DEFAULT_WINDOW_HEIGHT, screen_height)
+        self.minsize(min(920, width), min(600, height))
+        self.geometry(
+            f"{width}x{height}+{(screen_width - width) // 2}+{(screen_height - height) // 2}"
+        )
         self.db = Database()
         self.stock_alert_limit = self.db.get_stock_alert_limit()
         self.selected_product_id = None
@@ -556,6 +574,10 @@ class SalesApp(tk.Tk):
             actions, text="Anular venda selecionada", command=self.cancel_selected_sale, state="disabled"
         )
         self.cancel_sale_button.pack(side="left")
+        self.delete_sale_button = ttk.Button(
+            actions, text="Apagar venda selecionada", command=self.delete_selected_sale, state="disabled"
+        )
+        self.delete_sale_button.pack(side="left", padx=(8, 0))
         ttk.Label(actions, text="Duplo clique numa venda para ver os artigos e os dados da anulação.",
                   foreground="#555").pack(side="left", padx=10)
 
@@ -872,6 +894,7 @@ class SalesApp(tk.Tk):
         selection = self.history_tree.selection()
         can_cancel = bool(selection) and self.history_tree.item(selection[0], "values")[5] == "Concluída"
         self.cancel_sale_button.configure(state="normal" if can_cancel else "disabled")
+        self.delete_sale_button.configure(state="normal" if selection else "disabled")
 
     def cancel_selected_sale(self):
         selection = self.history_tree.selection()
@@ -901,6 +924,28 @@ class SalesApp(tk.Tk):
             )
         except ValueError as exc:
             messagebox.showerror("Não foi possível anular", str(exc))
+
+    def delete_selected_sale(self):
+        selection = self.history_tree.selection()
+        if not selection:
+            return
+        values = self.history_tree.item(selection[0], "values")
+        sale_id = int(values[0])
+        if not messagebox.askyesno(
+            "Apagar venda permanentemente",
+            f"Apagar a venda n.º {sale_id}, de {values[1]}, no valor de {values[2]}?\n\n"
+            "Esta ação é permanente e não altera o stock.",
+            parent=self
+        ):
+            return
+        try:
+            self.db.delete_sale(sale_id)
+            self.refresh_all()
+            messagebox.showinfo("Venda apagada", f"A venda n.º {sale_id} foi removida do histórico.")
+        except ValueError as exc:
+            messagebox.showerror("Não foi possível apagar", str(exc))
+        except sqlite3.Error as exc:
+            messagebox.showerror("Erro ao apagar venda", f"Não foi possível apagar a venda.\n{exc}")
 
     def show_sale_details(self, _event=None):
         selection = self.history_tree.selection()
