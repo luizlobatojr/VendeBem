@@ -1,17 +1,72 @@
 import csv
+import os
 import sqlite3
 import sys
+import tempfile
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
-APP_TITLE = "VendeBem"
-APP_DEVELOPER_SIGNATURE = "Feito por Luiz Lobato Junior • Engenheiro de Software"
+APP_TITLE = "Gerenciador de Vendas"
 DB_FILENAME = "gerenciador_vendas.db"
-APP_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
-DB_FILE = APP_DIR / DB_FILENAME
+
+
+def user_data_directory():
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if base:
+            return Path(base) / "VendeBem"
+        return Path.home() / "AppData" / "Local" / "VendeBem"
+
+    base = os.environ.get("XDG_DATA_HOME")
+    if base and Path(base).is_absolute():
+        return Path(base) / "VendeBem"
+    return Path.home() / ".local" / "share" / "VendeBem"
+
+
+def legacy_database_locations():
+    app_path = sys.executable if getattr(sys, "frozen", False) else __file__
+    app_directory = Path(app_path).resolve().parent
+    return (Path.cwd() / DB_FILENAME, app_directory / DB_FILENAME)
+
+
+def migrate_database(source, destination):
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=".vendebem-migration-", suffix=".db", dir=destination.parent
+    )
+    os.close(descriptor)
+    try:
+        source_connection = sqlite3.connect(str(source))
+        try:
+            destination_connection = sqlite3.connect(temporary_path)
+            try:
+                source_connection.backup(destination_connection)
+                integrity = destination_connection.execute("PRAGMA integrity_check").fetchone()
+                if not integrity or integrity[0] != "ok":
+                    raise sqlite3.DatabaseError("A verificação da cópia da base de dados falhou.")
+            finally:
+                destination_connection.close()
+        finally:
+            source_connection.close()
+        os.replace(temporary_path, destination)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def database_path():
+    destination = user_data_directory() / DB_FILENAME
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        return destination
+
+    for source in dict.fromkeys(path.resolve() for path in legacy_database_locations()):
+        if source.is_file() and source != destination.resolve():
+            migrate_database(source, destination)
+            break
+    return destination
 
 
 def money(value):
@@ -48,7 +103,7 @@ def calculate_discount(cart, percentage):
 
 class Database:
     def __init__(self, path=None):
-        self.path = Path(path) if path is not None else DB_FILE
+        self.path = Path(path) if path is not None else database_path()
         self.conn = sqlite3.connect(str(self.path))
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
@@ -310,7 +365,7 @@ class SalesApp(tk.Tk):
     def _build_ui(self):
         header = ttk.Frame(self, padding=(16, 12))
         header.pack(fill="x")
-        ttk.Label(header, text=APP_TITLE, style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text="Gerenciador de Vendas", style="Title.TLabel").pack(side="left")
         ttk.Label(header, text="Produtos • Stock • Vendas • Histórico").pack(side="right")
 
         self.metrics = ttk.Frame(self, padding=(12, 0, 12, 12))
@@ -336,16 +391,6 @@ class SalesApp(tk.Tk):
         self.tabs.add(self.products_tab, text="Mercadorias / Stock")
         self.tabs.add(self.sale_tab, text="Registar venda")
         self.tabs.add(self.history_tab, text="Histórico de vendas")
-
-        footer = ttk.Frame(self, padding=(12, 6, 12, 12))
-        footer.pack(fill="x")
-        ttk.Label(
-            footer,
-            text=APP_DEVELOPER_SIGNATURE,
-            foreground="#4b5563",
-            anchor="e"
-        ).pack(side="right")
-
         self._build_products_tab()
         self._build_sale_tab()
         self._build_history_tab()
@@ -615,18 +660,11 @@ class SalesApp(tk.Tk):
             else:
                 self.db.update_product(self.selected_product_id, name, code, category, cost, price, stock)
                 message = "Mercadoria atualizada com sucesso."
+            self.clear_product_form()
+            self.refresh_all()
+            messagebox.showinfo("Concluído", message)
         except sqlite3.IntegrityError:
             messagebox.showerror("Código duplicado", "Já existe uma mercadoria com esse código. Use outro código ou deixe-o vazio.")
-            return
-        except sqlite3.Error as exc:
-            messagebox.showerror(
-                "Falha ao guardar",
-                f"Não foi possível gravar a mercadoria na base de dados.\n{exc}"
-            )
-            return
-        self.clear_product_form()
-        self.refresh_all()
-        messagebox.showinfo("Concluído", message)
 
     def clear_product_form(self):
         self.selected_product_id = None
@@ -919,5 +957,12 @@ class SalesApp(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = SalesApp()
-    app.mainloop()
+    try:
+        app = SalesApp()
+    except (OSError, sqlite3.Error) as exc:
+        messagebox.showerror(
+            "Erro ao abrir os dados",
+            f"Não foi possível abrir ou migrar a base de dados.\n{exc}"
+        )
+    else:
+        app.mainloop()

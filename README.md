@@ -1,4 +1,4 @@
-# VendeBem — Gerenciador de Vendas
+# Gerenciador de Vendas (Python)
 
 Aplicação desktop simples para Windows e Linux, feita com Python, Tkinter e SQLite.
 
@@ -8,7 +8,7 @@ Aplicação desktop simples para Windows e Linux, feita com Python, Tkinter e SQ
 - Consultar detalhes de cada venda, incluindo anulações e descontos.
 - Configurar o limite de stock baixo e filtrar a lista de artigos por esse limite.
 - Ver indicadores: vendas de hoje, número de vendas, artigos, unidades em stock e artigos com stock baixo.
-- Guardar os dados localmente numa base de dados SQLite (`gerenciador_vendas.db`).
+- Guardar os dados localmente numa base de dados SQLite, separada dos ficheiros do programa.
 
 ## Requisitos
 - Python 3.10 ou superior.
@@ -27,16 +27,6 @@ Aplicação desktop simples para Windows e Linux, feita com Python, Tkinter e SQ
    python3 app.py
    ```
 
-### Criar atalho na Área de Trabalho
-
-Na pasta do programa, execute:
-
-```bash
-sh criar_atalho_linux.sh
-```
-
-O atalho **VendeBem** será criado na Área de Trabalho com o logo do programa.
-
 ## Executar no Windows
 1. Instale Python 3 a partir do site oficial: https://www.python.org/downloads/
 2. Durante a instalação, marque **Add Python to PATH**.
@@ -46,14 +36,17 @@ O atalho **VendeBem** será criado na Área de Trabalho com o logo do programa.
    py app.py
    ```
 
-### Criar atalho na Área de Trabalho
+## Atualizar sem perder os dados
+1. Feche o programa antes de atualizar.
+2. Faça uma cópia de segurança da base de dados (os caminhos estão indicados abaixo).
+3. Substitua os ficheiros do programa pela versão nova. Não apague a pasta de dados do utilizador.
+4. Inicie a nova versão. Se encontrar uma base de dados antiga junto ao programa, ela será copiada automaticamente para a nova pasta de dados. O ficheiro antigo não será apagado.
 
-Na pasta do programa, dê duplo clique em `criar_atalho_windows.vbs`. O atalho
-**VendeBem** será criado na Área de Trabalho com o logo do programa.
+Nas próximas versões, os registos ficam numa pasta própria do utilizador, independente da localização do programa:
+- Windows: `%LOCALAPPDATA%\VendeBem\gerenciador_vendas.db`
+- Linux: `~/.local/share/VendeBem/gerenciador_vendas.db` (ou `$XDG_DATA_HOME/VendeBem/gerenciador_vendas.db`, se essa variável estiver configurada)
 
-Mantenha a pasta do programa no mesmo local depois de criar o atalho. O atalho
-inicia o programa a partir dessa pasta, onde também fica o ficheiro de dados
-`gerenciador_vendas.db`.
+Para fazer uma cópia de segurança, feche o programa e copie o ficheiro `gerenciador_vendas.db` dessa pasta para um local seguro. Para restaurar, feche o programa e substitua o ficheiro pela cópia.
 
 ## Criar um executável para Windows (opcional)
 Dentro do terminal na pasta do projeto:
@@ -63,4 +56,4 @@ py -m PyInstaller --noconfirm --onefile --windowed --name GerenciadorDeVendas ap
 ```
 O executável será criado em `dist\GerenciadorDeVendas.exe`.
 
-**Nota:** a base de dados `gerenciador_vendas.db` fica na pasta do programa (ou, no executável, junto ao ficheiro `.exe`), independentemente da pasta de onde o atalho for iniciado. Faça cópias de segurança regulares desse ficheiro.
+**Nota:** a primeira inicialização após esta alteração pode migrar a base de dados existente. Mantenha uma cópia de segurança antes de atualizar.
