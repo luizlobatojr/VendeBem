@@ -63,4 +63,4 @@ py -m PyInstaller --noconfirm --onefile --windowed --name GerenciadorDeVendas ap
 ```
 O executável será criado em `dist\GerenciadorDeVendas.exe`.
 
-**Nota:** a base de dados é criada na pasta de execução do programa. Faça cópias de segurança regulares do ficheiro `gerenciador_vendas.db`.
+**Nota:** a base de dados `gerenciador_vendas.db` fica na pasta do programa (ou, no executável, junto ao ficheiro `.exe`), independentemente da pasta de onde o atalho for iniciado. Faça cópias de segurança regulares desse ficheiro.

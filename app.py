@@ -1,13 +1,17 @@
 import csv
 import sqlite3
+import sys
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from pathlib import Path
 
 APP_TITLE = "VendeBem"
 APP_DEVELOPER_SIGNATURE = "Feito por Luiz Lobato Junior • Engenheiro de Software"
-DB_FILE = "gerenciador_vendas.db"
+DB_FILENAME = "gerenciador_vendas.db"
+APP_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
+DB_FILE = APP_DIR / DB_FILENAME
 
 
 def money(value):
@@ -43,8 +47,9 @@ def calculate_discount(cart, percentage):
 
 
 class Database:
-    def __init__(self, path=DB_FILE):
-        self.conn = sqlite3.connect(path)
+    def __init__(self, path=None):
+        self.path = Path(path) if path is not None else DB_FILE
+        self.conn = sqlite3.connect(str(self.path))
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.create_tables()
@@ -610,11 +615,18 @@ class SalesApp(tk.Tk):
             else:
                 self.db.update_product(self.selected_product_id, name, code, category, cost, price, stock)
                 message = "Mercadoria atualizada com sucesso."
-            self.clear_product_form()
-            self.refresh_all()
-            messagebox.showinfo("Concluído", message)
         except sqlite3.IntegrityError:
             messagebox.showerror("Código duplicado", "Já existe uma mercadoria com esse código. Use outro código ou deixe-o vazio.")
+            return
+        except sqlite3.Error as exc:
+            messagebox.showerror(
+                "Falha ao guardar",
+                f"Não foi possível gravar a mercadoria na base de dados.\n{exc}"
+            )
+            return
+        self.clear_product_form()
+        self.refresh_all()
+        messagebox.showinfo("Concluído", message)
 
     def clear_product_form(self):
         self.selected_product_id = None
