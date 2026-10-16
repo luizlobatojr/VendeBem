@@ -1,4 +1,4 @@
-# Gerenciador de Vendas (Python)
+# VendeBem — Gerenciador de Vendas
 
 Aplicação desktop simples para Windows e Linux, feita com Python, Tkinter e SQLite.
 
@@ -27,6 +27,16 @@ Aplicação desktop simples para Windows e Linux, feita com Python, Tkinter e SQ
    python3 app.py
    ```
 
+### Criar atalho na Área de Trabalho
+
+Na pasta do programa, execute:
+
+```bash
+sh criar_atalho_linux.sh
+```
+
+O atalho **VendeBem** será criado na Área de Trabalho com o logo do programa.
+
 ## Executar no Windows
 1. Instale Python 3 a partir do site oficial: https://www.python.org/downloads/
 2. Durante a instalação, marque **Add Python to PATH**.
@@ -35,6 +45,15 @@ Aplicação desktop simples para Windows e Linux, feita com Python, Tkinter e SQ
    ```bat
    py app.py
    ```
+
+### Criar atalho na Área de Trabalho
+
+Na pasta do programa, dê duplo clique em `criar_atalho_windows.vbs`. O atalho
+**VendeBem** será criado na Área de Trabalho com o logo do programa.
+
+Mantenha a pasta do programa no mesmo local depois de criar o atalho. O atalho
+inicia o programa a partir dessa pasta, onde também fica o ficheiro de dados
+`gerenciador_vendas.db`.
 
 ## Criar um executável para Windows (opcional)
 Dentro do terminal na pasta do projeto:

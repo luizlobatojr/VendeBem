@@ -5,7 +5,8 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
-APP_TITLE = "Gerenciador de Vendas"
+APP_TITLE = "VendeBem"
+APP_DEVELOPER_SIGNATURE = "Feito por Luiz Lobato Junior • Engenheiro de Software"
 DB_FILE = "gerenciador_vendas.db"
 
 
@@ -304,7 +305,7 @@ class SalesApp(tk.Tk):
     def _build_ui(self):
         header = ttk.Frame(self, padding=(16, 12))
         header.pack(fill="x")
-        ttk.Label(header, text="Gerenciador de Vendas", style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text=APP_TITLE, style="Title.TLabel").pack(side="left")
         ttk.Label(header, text="Produtos • Stock • Vendas • Histórico").pack(side="right")
 
         self.metrics = ttk.Frame(self, padding=(12, 0, 12, 12))
@@ -330,6 +331,16 @@ class SalesApp(tk.Tk):
         self.tabs.add(self.products_tab, text="Mercadorias / Stock")
         self.tabs.add(self.sale_tab, text="Registar venda")
         self.tabs.add(self.history_tab, text="Histórico de vendas")
+
+        footer = ttk.Frame(self, padding=(12, 6, 12, 12))
+        footer.pack(fill="x")
+        ttk.Label(
+            footer,
+            text=APP_DEVELOPER_SIGNATURE,
+            foreground="#4b5563",
+            anchor="e"
+        ).pack(side="right")
+
         self._build_products_tab()
         self._build_sale_tab()
         self._build_history_tab()
