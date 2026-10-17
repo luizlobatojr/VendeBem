@@ -5,7 +5,7 @@ import sys
 import tempfile
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
@@ -13,6 +13,14 @@ APP_TITLE = "Gerenciador de Vendas"
 DB_FILENAME = "gerenciador_vendas.db"
 DEFAULT_WINDOW_WIDTH = 1120
 DEFAULT_WINDOW_HEIGHT = 720
+COLOR_PRIMARY = "#0284c7"
+COLOR_BACKGROUND = "#f8fafc"
+COLOR_SURFACE = "#ffffff"
+COLOR_TEXT = "#0f172a"
+COLOR_MUTED = "#475569"
+COLOR_BORDER = "#e2e8f0"
+COLOR_WARNING = "#f59e0b"
+COLOR_DANGER = "#ef4444"
 
 
 def user_data_directory():
@@ -73,6 +81,17 @@ def database_path():
 
 def money(value):
     return f"€ {float(value):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def center_window(window, width, height):
+    screen_width = max(1, window.winfo_screenwidth())
+    screen_height = max(1, window.winfo_screenheight())
+    width = max(1, min(width, screen_width))
+    height = max(1, min(height, screen_height))
+    x = max(0, (screen_width - width) // 2)
+    y = max(0, (screen_height - height) // 2)
+    window.geometry(f"{width}x{height}+{x}+{y}")
+    return width, height
 
 
 def parse_price(value):
@@ -141,6 +160,7 @@ class Database:
                     product_name TEXT NOT NULL,
                     quantity INTEGER NOT NULL CHECK(quantity > 0),
                     unit_price REAL NOT NULL,
+                    unit_cost REAL NOT NULL DEFAULT 0,
                     subtotal REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS app_settings (
@@ -159,6 +179,19 @@ class Database:
                 self.conn.execute("ALTER TABLE sales ADD COLUMN discount_percent REAL NOT NULL DEFAULT 0")
             if "discount_amount" not in columns:
                 self.conn.execute("ALTER TABLE sales ADD COLUMN discount_amount REAL NOT NULL DEFAULT 0")
+            item_columns = {
+                row[1] for row in self.conn.execute("PRAGMA table_info(sale_items)")
+            }
+            if "unit_cost" not in item_columns:
+                self.conn.execute(
+                    "ALTER TABLE sale_items ADD COLUMN unit_cost REAL NOT NULL DEFAULT 0"
+                )
+                self.conn.execute("""
+                    UPDATE sale_items
+                    SET unit_cost=COALESCE(
+                        (SELECT cost FROM products WHERE products.id=sale_items.product_id), 0
+                    )
+                """)
 
     def close(self):
         self.conn.close()
@@ -181,6 +214,19 @@ class Database:
                 "INSERT INTO app_settings(key, value) VALUES ('stock_alert_limit', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(limit),)
+            )
+
+    def reset_data(self):
+        with self.conn:
+            self.conn.execute("DELETE FROM sale_items")
+            self.conn.execute("DELETE FROM sales")
+            self.conn.execute("DELETE FROM products")
+            self.conn.execute(
+                "DELETE FROM sqlite_sequence WHERE name IN ('sale_items', 'sales', 'products')"
+            )
+            self.conn.execute(
+                "INSERT INTO app_settings(key, value) VALUES ('stock_alert_limit', '5') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
             )
 
     def products(self, search="", low_stock_limit=None):
@@ -221,15 +267,17 @@ class Database:
         if not cart:
             raise ValueError("Adicione pelo menos um artigo à venda.")
         subtotal, discount, total = calculate_discount(cart, discount_percent)
+        product_costs = {}
         with self.conn:
             for product_id, item in cart.items():
                 row = self.conn.execute(
-                    "SELECT name, stock FROM products WHERE id=?", (product_id,)
+                    "SELECT name, stock, cost FROM products WHERE id=?", (product_id,)
                 ).fetchone()
                 if row is None:
                     raise ValueError("Um artigo da venda já não existe.")
                 if row["stock"] < item["quantity"]:
                     raise ValueError(f"Stock insuficiente para {row['name']}. Disponível: {row['stock']}.")
+                product_costs[product_id] = row["cost"]
             cur = self.conn.execute(
                 """INSERT INTO sales(
                     sold_at, total, payment_method, discount_percent, discount_amount
@@ -241,9 +289,13 @@ class Database:
             for product_id, item in cart.items():
                 subtotal = item["quantity"] * item["price"]
                 self.conn.execute("""
-                    INSERT INTO sale_items(sale_id, product_id, product_name, quantity, unit_price, subtotal)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (sale_id, product_id, item["name"], item["quantity"], item["price"], subtotal))
+                    INSERT INTO sale_items(
+                        sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    sale_id, product_id, item["name"], item["quantity"],
+                    item["price"], product_costs[product_id], subtotal
+                ))
                 self.conn.execute(
                     "UPDATE products SET stock=stock-? WHERE id=?",
                     (item["quantity"], product_id)
@@ -330,6 +382,64 @@ class Database:
             "SELECT * FROM sale_items WHERE sale_id=? ORDER BY id", (sale_id,)
         ).fetchall()
 
+    def sales_report(self, date_from, date_to):
+        start = datetime.strptime(date_from, "%Y-%m-%d")
+        end = datetime.strptime(date_to, "%Y-%m-%d")
+        if end < start:
+            raise ValueError("A data inicial deve ser anterior ou igual à data final.")
+        start_timestamp = f"{date_from} 00:00:00"
+        end_timestamp = f"{(end + timedelta(days=1)).strftime('%Y-%m-%d')} 00:00:00"
+        conditions = "sold_at >= ? AND sold_at < ? AND canceled_at IS NULL"
+        params = (start_timestamp, end_timestamp)
+
+        summary = self.conn.execute(f"""
+            SELECT COUNT(*) AS sale_count,
+                   COALESCE(SUM(total), 0) AS revenue,
+                   COALESCE(SUM(discount_amount), 0) AS discounts,
+                   COALESCE(SUM((
+                       SELECT SUM(si.quantity * si.unit_cost)
+                       FROM sale_items si WHERE si.sale_id=sales.id
+                   )), 0) AS cost
+            FROM sales WHERE {conditions}
+        """, params).fetchone()
+        top_product = self.conn.execute("""
+            SELECT si.product_name, SUM(si.quantity) AS quantity
+            FROM sale_items si
+            JOIN sales s ON s.id=si.sale_id
+            WHERE s.sold_at >= ? AND s.sold_at < ? AND s.canceled_at IS NULL
+            GROUP BY si.product_id, si.product_name
+            ORDER BY quantity DESC, si.product_name COLLATE NOCASE
+            LIMIT 1
+        """, params).fetchone()
+        top_payment = self.conn.execute("""
+            SELECT payment_method, SUM(total) AS revenue
+            FROM sales
+            WHERE sold_at >= ? AND sold_at < ? AND canceled_at IS NULL
+            GROUP BY payment_method
+            ORDER BY revenue DESC, payment_method COLLATE NOCASE
+            LIMIT 1
+        """, params).fetchone()
+        daily_rows = self.conn.execute("""
+            SELECT substr(s.sold_at, 1, 10) AS sale_date,
+                   COUNT(*) AS sale_count,
+                   SUM(s.total) AS revenue,
+                   SUM(s.discount_amount) AS discounts,
+                   COALESCE(SUM((
+                       SELECT SUM(si.quantity * si.unit_cost)
+                       FROM sale_items si WHERE si.sale_id=s.id
+                   )), 0) AS cost
+            FROM sales s
+            WHERE s.sold_at >= ? AND s.sold_at < ? AND s.canceled_at IS NULL
+            GROUP BY sale_date
+            ORDER BY sale_date DESC
+        """, params).fetchall()
+        return {
+            "summary": summary,
+            "top_product": top_product,
+            "top_payment": top_payment,
+            "daily": daily_rows,
+        }
+
     def summary(self, low_stock_limit=5):
         today = datetime.now().strftime("%Y-%m-%d")
         total_today = self.conn.execute(
@@ -350,15 +460,12 @@ class Database:
 class SalesApp(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.withdraw()
         self.title(APP_TITLE)
-        screen_width = self.winfo_screenwidth()
-        screen_height = self.winfo_screenheight()
-        width = min(DEFAULT_WINDOW_WIDTH, screen_width)
-        height = min(DEFAULT_WINDOW_HEIGHT, screen_height)
-        self.minsize(min(920, width), min(600, height))
-        self.geometry(
-            f"{width}x{height}+{(screen_width - width) // 2}+{(screen_height - height) // 2}"
+        width, height = center_window(
+            self, DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT
         )
+        self.minsize(min(920, width), min(600, height))
         self.db = Database()
         self.stock_alert_limit = self.db.get_stock_alert_limit()
         self.selected_product_id = None
@@ -367,6 +474,8 @@ class SalesApp(tk.Tk):
         self._build_ui()
         self.refresh_all()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        center_window(self, width, height)
+        self.deiconify()
 
     def _configure_style(self):
         style = ttk.Style(self)
@@ -374,11 +483,110 @@ class SalesApp(tk.Tk):
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("Title.TLabel", font=("TkDefaultFont", 18, "bold"))
-        style.configure("Metric.TLabel", font=("TkDefaultFont", 12, "bold"))
-        style.configure("Treeview", rowheight=27)
-        style.configure("Treeview.Heading", font=("TkDefaultFont", 10, "bold"))
-        style.configure("Accent.TButton", font=("TkDefaultFont", 10, "bold"))
+        self.configure(background=COLOR_BACKGROUND)
+        style.configure(".", background=COLOR_BACKGROUND, foreground=COLOR_TEXT)
+        style.configure("TFrame", background=COLOR_BACKGROUND)
+        style.configure("TLabel", background=COLOR_BACKGROUND, foreground=COLOR_TEXT)
+        style.configure(
+            "Title.TLabel", background=COLOR_BACKGROUND, foreground=COLOR_PRIMARY,
+            font=("TkDefaultFont", 18, "bold")
+        )
+        style.configure(
+            "Metric.TLabel", background=COLOR_SURFACE, foreground=COLOR_TEXT,
+            font=("TkDefaultFont", 12, "bold")
+        )
+        style.configure(
+            "Welcome.TLabel", background=COLOR_BACKGROUND, foreground=COLOR_TEXT,
+            font=("TkDefaultFont", 20, "bold")
+        )
+        style.configure(
+            "WelcomeMessage.TLabel", background=COLOR_BACKGROUND, foreground=COLOR_MUTED,
+            font=("TkDefaultFont", 11)
+        )
+        style.configure(
+            "ReportMetric.TLabel", background=COLOR_BACKGROUND, foreground=COLOR_TEXT,
+            font=("TkDefaultFont", 13, "bold")
+        )
+        style.configure(
+            "ReportDetail.TLabel", background=COLOR_BACKGROUND, foreground=COLOR_MUTED
+        )
+        style.configure(
+            "TLabelframe", background=COLOR_BACKGROUND, bordercolor=COLOR_BORDER
+        )
+        style.configure(
+            "TLabelframe.Label", background=COLOR_BACKGROUND, foreground=COLOR_MUTED
+        )
+        style.configure(
+            "TNotebook", background=COLOR_BACKGROUND, bordercolor=COLOR_BORDER
+        )
+        style.configure(
+            "TNotebook.Tab", background="#e2e8f0", foreground=COLOR_MUTED,
+            padding=(12, 7)
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", COLOR_SURFACE), ("active", "#f1f5f9")],
+            foreground=[("selected", COLOR_PRIMARY)],
+        )
+        style.configure(
+            "TButton", background="#e2e8f0", foreground=COLOR_TEXT, padding=(8, 5)
+        )
+        style.map(
+            "TButton",
+            background=[("disabled", "#e2e8f0"), ("active", "#cbd5e1")],
+            foreground=[("disabled", "#94a3b8")],
+        )
+        style.configure(
+            "TEntry", fieldbackground=COLOR_SURFACE, foreground=COLOR_TEXT
+        )
+        style.configure(
+            "TCombobox", fieldbackground=COLOR_SURFACE, foreground=COLOR_TEXT
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", COLOR_SURFACE)],
+            foreground=[("readonly", COLOR_TEXT)],
+        )
+        style.configure(
+            "TSpinbox", fieldbackground=COLOR_SURFACE, foreground=COLOR_TEXT
+        )
+        style.configure(
+            "Treeview", rowheight=27, background=COLOR_SURFACE,
+            fieldbackground=COLOR_SURFACE, foreground=COLOR_TEXT,
+            bordercolor=COLOR_BORDER
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", COLOR_PRIMARY)],
+            foreground=[("selected", COLOR_SURFACE)],
+        )
+        style.configure(
+            "Treeview.Heading", font=("TkDefaultFont", 10, "bold"),
+            background="#e2e8f0", foreground=COLOR_TEXT
+        )
+        style.map("Treeview.Heading", background=[("active", "#cbd5e1")])
+        style.configure(
+            "Accent.TButton",
+            font=("TkDefaultFont", 10, "bold"),
+            foreground=COLOR_SURFACE,
+            background=COLOR_PRIMARY,
+            padding=(12, 8),
+        )
+        style.map(
+            "Accent.TButton",
+            foreground=[("disabled", "#d9e2e8"), ("active", COLOR_SURFACE)],
+            background=[("disabled", "#94a3b8"), ("active", "#0369a1")],
+        )
+        style.configure(
+            "Danger.TButton",
+            foreground=COLOR_SURFACE,
+            background=COLOR_DANGER,
+        )
+        style.map(
+            "Danger.TButton",
+            foreground=[("disabled", "#f1f5f9"), ("active", COLOR_SURFACE)],
+            background=[("disabled", "#cbd5e1"), ("active", "#dc2626")],
+        )
 
     def _build_ui(self):
         header = ttk.Frame(self, padding=(16, 12))
@@ -386,32 +594,98 @@ class SalesApp(tk.Tk):
         ttk.Label(header, text="Gerenciador de Vendas", style="Title.TLabel").pack(side="left")
         ttk.Label(header, text="Produtos • Stock • Vendas • Histórico").pack(side="right")
 
-        self.metrics = ttk.Frame(self, padding=(12, 0, 12, 12))
+        self.tabs = ttk.Notebook(self)
+        self.tabs.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.home_tab = ttk.Frame(self.tabs, padding=16)
+        self.products_tab = ttk.Frame(self.tabs, padding=10)
+        self.sale_tab = ttk.Frame(self.tabs, padding=10)
+        self.history_tab = ttk.Frame(self.tabs, padding=10)
+        self.reports_tab = ttk.Frame(self.tabs, padding=10)
+        self.tabs.add(self.home_tab, text="Início")
+        self.tabs.add(self.products_tab, text="Mercadorias / Stock")
+        self.tabs.add(self.sale_tab, text="Registar venda")
+        self.tabs.add(self.history_tab, text="Histórico de vendas")
+        self.tabs.add(self.reports_tab, text="Rendimentos / Relatórios")
+        self._build_home_tab()
+        self._build_products_tab()
+        self._build_sale_tab()
+        self._build_history_tab()
+        self._build_reports_tab()
+        self.tabs.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    def _build_home_tab(self):
+        greeting = "Bom dia" if datetime.now().hour < 12 else (
+            "Boa tarde" if datetime.now().hour < 19 else "Boa noite"
+        )
+        welcome = ttk.Frame(self.home_tab, padding=(8, 12, 8, 18))
+        welcome.pack(fill="x")
+        ttk.Label(welcome, text=f"{greeting}!", style="Welcome.TLabel").pack(anchor="w")
+        ttk.Label(
+            welcome,
+            text="Bem-vindo ao seu sistema de faturação e gestão de stock.",
+            style="WelcomeMessage.TLabel",
+        ).pack(anchor="w", pady=(6, 2))
+        ttk.Label(
+            welcome, text=f"Hoje é {datetime.now().strftime('%d/%m/%Y')}."
+        ).pack(anchor="w")
+
+        self.metrics = ttk.Frame(self.home_tab, padding=(0, 4, 0, 18))
         self.metrics.pack(fill="x")
         self.metric_labels = {}
         self.metric_boxes = {}
         for key, title in [
             ("today", "Vendas de hoje"), ("sales", "Vendas registadas"),
-            ("products", "Artigos"), ("units", "Unidades em stock"), ("low", "Stock baixo (≤ 5)")
+            ("products", "Artigos"), ("units", "Unidades em stock"),
+            ("low", f"Stock baixo (≤ {self.stock_alert_limit})"),
         ]:
-            box = ttk.LabelFrame(self.metrics, text=title, padding=10)
+            box = ttk.LabelFrame(self.metrics, text=title, padding=12)
             box.pack(side="left", fill="both", expand=True, padx=4)
             self.metric_boxes[key] = box
             label = ttk.Label(box, text="—", style="Metric.TLabel")
-            label.pack()
+            label.pack(pady=4)
             self.metric_labels[key] = label
 
-        self.tabs = ttk.Notebook(self)
-        self.tabs.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        self.products_tab = ttk.Frame(self.tabs, padding=10)
-        self.sale_tab = ttk.Frame(self.tabs, padding=10)
-        self.history_tab = ttk.Frame(self.tabs, padding=10)
-        self.tabs.add(self.products_tab, text="Mercadorias / Stock")
-        self.tabs.add(self.sale_tab, text="Registar venda")
-        self.tabs.add(self.history_tab, text="Histórico de vendas")
-        self._build_products_tab()
-        self._build_sale_tab()
-        self._build_history_tab()
+        actions = ttk.LabelFrame(
+            self.home_tab, text="Atalhos e ações rápidas", padding=(12, 14)
+        )
+        actions.pack(fill="x")
+        ttk.Button(
+            actions,
+            text="Registar nova venda",
+            style="Accent.TButton",
+            command=lambda: self.tabs.select(self.sale_tab),
+        ).pack(side="left", fill="x", expand=True, padx=5, ipady=5)
+        ttk.Button(
+            actions,
+            text="Gerir stock / mercadorias",
+            command=lambda: self.tabs.select(self.products_tab),
+        ).pack(side="left", fill="x", expand=True, padx=5, ipady=5)
+        ttk.Button(
+            actions,
+            text="Consultar histórico",
+            command=lambda: self.tabs.select(self.history_tab),
+        ).pack(side="left", fill="x", expand=True, padx=5, ipady=5)
+        reset_actions = ttk.LabelFrame(
+            self.home_tab, text="Zona de reposição", padding=(12, 10)
+        )
+        reset_actions.pack(fill="x", pady=(18, 0))
+        ttk.Label(
+            reset_actions,
+            text="Apaga permanentemente os produtos e o histórico de vendas.",
+            style="ReportDetail.TLabel",
+        ).pack(side="left", padx=(0, 12))
+        ttk.Button(
+            reset_actions,
+            text="Repor aplicação",
+            style="Danger.TButton",
+            command=self.reset_application,
+        ).pack(side="right")
+
+    def _on_tab_changed(self, _event=None):
+        if self.tabs.select() == str(self.home_tab):
+            self.refresh_metrics()
+        elif self.tabs.select() == str(self.reports_tab):
+            self.refresh_report()
 
     def _build_products_tab(self):
         tab = self.products_tab
@@ -469,6 +743,9 @@ class SalesApp(tk.Tk):
         for c in cols:
             self.product_tree.heading(c, text=headings[c])
             self.product_tree.column(c, width=widths[c], anchor="w" if c in ("name","code","category") else "center")
+        self.product_tree.tag_configure(
+            "low_stock", background="#fff1f2", foreground="#9f1239"
+        )
         self.product_tree.pack(fill="both", expand=True)
         self.product_tree.bind("<<TreeviewSelect>>", self.on_product_select)
 
@@ -559,6 +836,9 @@ class SalesApp(tk.Tk):
         ttk.Button(second_row, text="Exportar CSV", command=self.export_history_csv).pack(side="right")
         cols = ("id","date","total","payment","units","status")
         self.history_tree = ttk.Treeview(tab, columns=cols, show="headings")
+        self.history_tree.tag_configure(
+            "canceled", background="#fee2e2", foreground="#991b1b"
+        )
         for c, title, width in [
             ("id","N.º venda",90), ("date","Data e hora",220), ("total","Total",130),
             ("payment","Pagamento",150), ("units","Unidades",100), ("status","Estado",100)
@@ -571,15 +851,206 @@ class SalesApp(tk.Tk):
         actions = ttk.Frame(tab, padding=(0, 8, 0, 0))
         actions.pack(fill="x")
         self.cancel_sale_button = ttk.Button(
-            actions, text="Anular venda selecionada", command=self.cancel_selected_sale, state="disabled"
+            actions, text="Anular venda selecionada", command=self.cancel_selected_sale,
+            state="disabled", style="Danger.TButton"
         )
         self.cancel_sale_button.pack(side="left")
         self.delete_sale_button = ttk.Button(
-            actions, text="Apagar venda selecionada", command=self.delete_selected_sale, state="disabled"
+            actions, text="Apagar venda selecionada", command=self.delete_selected_sale,
+            state="disabled", style="Danger.TButton"
         )
         self.delete_sale_button.pack(side="left", padx=(8, 0))
         ttk.Label(actions, text="Duplo clique numa venda para ver os artigos e os dados da anulação.",
                   foreground="#555").pack(side="left", padx=10)
+
+    def _build_reports_tab(self):
+        filters = ttk.LabelFrame(self.reports_tab, text="Período do relatório", padding=10)
+        filters.pack(fill="x", pady=(0, 10))
+        self.report_period = tk.StringVar(value="Este mês")
+        ttk.Label(filters, text="Período:").pack(side="left")
+        period_picker = ttk.Combobox(
+            filters,
+            textvariable=self.report_period,
+            values=("Hoje", "Este mês", "Mês anterior", "Ano atual", "Personalizado"),
+            state="readonly",
+            width=16,
+        )
+        period_picker.pack(side="left", padx=(6, 14))
+        today = datetime.now().date()
+        self.report_date_from = tk.StringVar(value=today.replace(day=1).strftime("%Y-%m-%d"))
+        self.report_date_to = tk.StringVar(value=today.strftime("%Y-%m-%d"))
+        ttk.Label(filters, text="De (AAAA-MM-DD):").pack(side="left")
+        self.report_date_from_entry = ttk.Entry(
+            filters, textvariable=self.report_date_from, width=13, state="readonly"
+        )
+        self.report_date_from_entry.pack(side="left", padx=(5, 10))
+        ttk.Label(filters, text="Até:").pack(side="left")
+        self.report_date_to_entry = ttk.Entry(
+            filters, textvariable=self.report_date_to, width=13, state="readonly"
+        )
+        self.report_date_to_entry.pack(side="left", padx=(5, 10))
+        ttk.Button(
+            filters, text="Atualizar relatório", command=self.refresh_report,
+            style="Accent.TButton"
+        ).pack(side="right")
+        period_picker.bind("<<ComboboxSelected>>", self._on_report_period_changed)
+
+        metrics = ttk.Frame(self.reports_tab)
+        metrics.pack(fill="x", pady=(0, 10))
+        self.report_metric_labels = {}
+        metric_titles = (
+            ("revenue", "Total faturado"),
+            ("cost", "Custo das mercadorias"),
+            ("profit", "Lucro bruto"),
+            ("margin", "Margem de lucro"),
+            ("discounts", "Descontos concedidos"),
+            ("average", "Ticket médio"),
+        )
+        for index, (key, title) in enumerate(metric_titles):
+            card = ttk.LabelFrame(metrics, text=title, padding=10)
+            card.grid(row=index // 3, column=index % 3, sticky="nsew", padx=4, pady=4)
+            value = ttk.Label(card, text="—", style="ReportMetric.TLabel")
+            value.pack(anchor="w", pady=3)
+            self.report_metric_labels[key] = value
+        for column in range(3):
+            metrics.columnconfigure(column, weight=1)
+
+        leaders = ttk.Frame(self.reports_tab)
+        leaders.pack(fill="x", pady=(0, 10))
+        self.report_top_product_label = ttk.Label(
+            leaders, text="Artigo mais vendido: —", style="ReportDetail.TLabel"
+        )
+        self.report_top_product_label.pack(side="left", anchor="w")
+        self.report_top_payment_label = ttk.Label(
+            leaders, text="Pagamento com maior faturação: —", style="ReportDetail.TLabel"
+        )
+        self.report_top_payment_label.pack(side="right", anchor="e")
+
+        daily_frame = ttk.LabelFrame(
+            self.reports_tab, text="Desempenho diário", padding=8
+        )
+        daily_frame.pack(fill="both", expand=True)
+        columns = ("date", "sales", "revenue", "cost", "discounts", "profit")
+        self.report_daily_tree = ttk.Treeview(
+            daily_frame, columns=columns, show="headings", height=10
+        )
+        for column, title, width in (
+            ("date", "Data", 130),
+            ("sales", "Vendas", 90),
+            ("revenue", "Faturação", 150),
+            ("cost", "Custos", 150),
+            ("discounts", "Descontos", 150),
+            ("profit", "Lucro bruto", 150),
+        ):
+            self.report_daily_tree.heading(column, text=title)
+            self.report_daily_tree.column(
+                column, width=width, anchor="w" if column == "date" else "center"
+            )
+        self.report_daily_tree.pack(fill="both", expand=True)
+
+    def _on_report_period_changed(self, _event=None):
+        today = datetime.now().date()
+        period = self.report_period.get()
+        if period == "Hoje":
+            start = end = today
+        elif period == "Este mês":
+            start = today.replace(day=1)
+            end = today
+        elif period == "Mês anterior":
+            end = today.replace(day=1) - timedelta(days=1)
+            start = end.replace(day=1)
+        elif period == "Ano atual":
+            start = today.replace(month=1, day=1)
+            end = today
+        else:
+            self.report_date_from_entry.configure(state="normal")
+            self.report_date_to_entry.configure(state="normal")
+            return
+
+        self.report_date_from.set(start.strftime("%Y-%m-%d"))
+        self.report_date_to.set(end.strftime("%Y-%m-%d"))
+        self.report_date_from_entry.configure(state="readonly")
+        self.report_date_to_entry.configure(state="readonly")
+        self.refresh_report()
+
+    def refresh_report(self):
+        date_from = self.report_date_from.get().strip()
+        date_to = self.report_date_to.get().strip()
+        try:
+            parsed_from = datetime.strptime(date_from, "%Y-%m-%d")
+            parsed_to = datetime.strptime(date_to, "%Y-%m-%d")
+        except ValueError:
+            messagebox.showerror(
+                "Data inválida",
+                "Informe as datas no formato AAAA-MM-DD.",
+                parent=self,
+            )
+            return
+        if (
+            parsed_from.strftime("%Y-%m-%d") != date_from
+            or parsed_to.strftime("%Y-%m-%d") != date_to
+        ):
+            messagebox.showerror(
+                "Data inválida",
+                "Informe as datas no formato AAAA-MM-DD.",
+                parent=self,
+            )
+            return
+        if parsed_to < parsed_from:
+            messagebox.showerror(
+                "Período inválido",
+                "A data inicial deve ser anterior ou igual à data final.",
+                parent=self,
+            )
+            return
+        report = self.db.sales_report(date_from, date_to)
+
+        summary = report["summary"]
+        revenue = summary["revenue"]
+        cost = summary["cost"]
+        profit = revenue - cost
+        margin = profit / revenue * 100 if revenue else 0
+        sale_count = summary["sale_count"]
+        metrics = {
+            "revenue": money(revenue),
+            "cost": money(cost),
+            "profit": money(profit),
+            "margin": f"{margin:.1f}%".replace(".", ","),
+            "discounts": money(summary["discounts"]),
+            "average": money(revenue / sale_count if sale_count else 0),
+        }
+        for key, value in metrics.items():
+            self.report_metric_labels[key].configure(text=value)
+
+        top_product = report["top_product"]
+        if top_product:
+            product_text = (
+                f"Artigo mais vendido: {top_product['product_name']} "
+                f"({top_product['quantity']} un.)"
+            )
+        else:
+            product_text = "Artigo mais vendido: —"
+        self.report_top_product_label.configure(text=product_text)
+
+        top_payment = report["top_payment"]
+        payment_text = (
+            f"Pagamento com maior faturação: {top_payment['payment_method']} "
+            f"({money(top_payment['revenue'])})"
+            if top_payment else "Pagamento com maior faturação: —"
+        )
+        self.report_top_payment_label.configure(text=payment_text)
+
+        self.report_daily_tree.delete(*self.report_daily_tree.get_children())
+        for row in report["daily"]:
+            daily_profit = row["revenue"] - row["cost"]
+            self.report_daily_tree.insert("", "end", values=(
+                datetime.strptime(row["sale_date"], "%Y-%m-%d").strftime("%d/%m/%Y"),
+                row["sale_count"],
+                money(row["revenue"]),
+                money(row["cost"]),
+                money(row["discounts"]),
+                money(daily_profit),
+            ))
 
     def apply_history_filters(self):
         date_from = self.history_date_from.get().strip()
@@ -851,13 +1322,13 @@ class SalesApp(tk.Tk):
 
     def refresh_products(self):
         self.product_tree.delete(*self.product_tree.get_children())
-        limit = self.stock_alert_limit if self.low_stock_only.get() else None
-        rows = self.db.products(self.product_search.get(), low_stock_limit=limit)
+        filter_limit = self.stock_alert_limit if self.low_stock_only.get() else None
+        rows = self.db.products(self.product_search.get(), low_stock_limit=filter_limit)
         for row in rows:
             self.product_tree.insert("", "end", values=(
                 row["id"], row["name"], row["code"] or "", row["category"] or "",
                 money(row["cost"]), money(row["price"]), row["stock"]
-            ))
+            ), tags=("low_stock",) if row["stock"] <= self.stock_alert_limit else ())
         self.sale_product_ids = []
         choices = []
         for row in self.db.products():
@@ -887,7 +1358,7 @@ class SalesApp(tk.Tk):
             self.history_tree.insert("", "end", values=(
                 row["id"], row["sold_at"], money(row["total"]), row["payment_method"],
                 row["units"], "Anulada" if row["canceled_at"] else "Concluída"
-            ))
+            ), tags=("canceled",) if row["canceled_at"] else ())
         self._update_cancel_button_state()
 
     def _update_cancel_button_state(self, _event=None):
@@ -990,18 +1461,131 @@ class SalesApp(tk.Tk):
         self.metric_labels["products"].configure(text=str(products))
         self.metric_labels["units"].configure(text=str(units))
         self.metric_labels["low"].configure(text=str(low))
+        self.metric_labels["low"].configure(
+            foreground=COLOR_WARNING if low else COLOR_TEXT
+        )
 
     def refresh_all(self):
         self.refresh_products()
         self.refresh_history()
         self.refresh_metrics()
+        self.refresh_report()
+
+    def reset_application(self):
+        warning = (
+            "Esta ação apaga permanentemente todos os produtos, vendas e artigos vendidos, "
+            "e repõe o limite de stock baixo para 5."
+        )
+        if self.cart:
+            warning += "\n\nO carrinho atual também será apagado."
+        warning += "\n\nEsta operação não pode ser desfeita. Pretende continuar?"
+        if not messagebox.askyesno(
+            "Repor aplicação — confirmação 1 de 2",
+            warning,
+            icon="warning",
+            parent=self,
+        ):
+            return
+        if not messagebox.askyesno(
+            "Confirmar reposição — confirmação 2 de 2",
+            "Confirma que pretende apagar definitivamente todos estes dados?",
+            icon="warning",
+            parent=self,
+        ):
+            return
+
+        try:
+            self.db.reset_data()
+        except sqlite3.Error as exc:
+            messagebox.showerror(
+                "Falha ao repor aplicação",
+                f"A base de dados não foi reposta.\n{exc}",
+                parent=self,
+            )
+            return
+
+        self.cart.clear()
+        self.discount_percent.set("0")
+        self.refresh_cart()
+        self.clear_product_form()
+        self.product_search.set("")
+        self.low_stock_only.set(False)
+        self.stock_alert_limit = 5
+        self.stock_limit_var.set("5")
+        self.metric_boxes["low"].configure(text="Stock baixo (≤ 5)")
+        self.active_history_filters = {
+            "search": "",
+            "date_from": "",
+            "date_to": "",
+            "payment_method": "Todos",
+            "product_search": "",
+        }
+        self.clear_history_filters()
+        self.report_period.set("Este mês")
+        self._on_report_period_changed()
+        self.refresh_all()
+        messagebox.showinfo(
+            "Aplicação reposta",
+            "Os produtos e o histórico foram removidos. O limite de stock foi reposto para 5.",
+            parent=self,
+        )
 
     def on_close(self):
+        if self.cart:
+            item_count = len(self.cart)
+            unit_count = sum(item["quantity"] for item in self.cart.values())
+            if not messagebox.askyesno(
+                "Carrinho com artigos pendentes",
+                f"O carrinho contém {item_count} artigo(s), num total de {unit_count} unidade(s), "
+                "que não foram registados.\n\nPretende fechar a aplicação e perder estes dados?",
+                parent=self,
+            ):
+                return
         self.db.close()
         self.destroy()
 
 
+def show_splash_screen():
+    splash = tk.Tk()
+    splash.withdraw()
+    splash.overrideredirect(True)
+    splash.configure(background=COLOR_BORDER)
+
+    panel = tk.Frame(splash, background=COLOR_SURFACE)
+    panel.pack(fill="both", expand=True, padx=2, pady=2)
+    tk.Label(
+        panel,
+        text="GERENCIADOR DE VENDAS",
+        font=("TkDefaultFont", 22, "bold"),
+        foreground=COLOR_PRIMARY,
+        background=COLOR_SURFACE,
+    ).pack(pady=(64, 10))
+    tk.Label(
+        panel,
+        text="Faturação e gestão de stock",
+        font=("TkDefaultFont", 11),
+        foreground=COLOR_MUTED,
+        background=COLOR_SURFACE,
+    ).pack()
+    tk.Frame(panel, height=3, background=COLOR_PRIMARY).pack(
+        fill="x", padx=150, pady=30
+    )
+    tk.Label(
+        panel,
+        text="Desenvolvedor: Luiz Lobato Jr",
+        font=("TkDefaultFont", 10),
+        foreground=COLOR_MUTED,
+        background=COLOR_SURFACE,
+    ).pack(side="bottom", pady=(0, 22))
+
+    center_window(splash, 520, 280)
+    splash.deiconify()
+    splash.after(4000, splash.destroy)
+    splash.mainloop()
+
+
 if __name__ == "__main__":
+    show_splash_screen()
     try:
         app = SalesApp()
     except (OSError, sqlite3.Error) as exc:

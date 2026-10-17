@@ -6,6 +6,9 @@ Aplicação desktop simples para Windows e Linux, feita com Python, Tkinter e SQ
 - Editar quantidades no carrinho e aplicar desconto percentual antes de finalizar a venda.
 - Consultar o histórico com filtros por período, pagamento e artigo, e exportar os resultados em CSV.
 - Consultar detalhes de cada venda, incluindo anulações e descontos; anular ou apagar uma venda selecionada no histórico.
+- Consultar relatórios de rendimentos por dia, mês, ano ou período personalizado, com faturação, custos, lucro bruto, margem, descontos, ticket médio, artigos mais vendidos, métodos de pagamento e desempenho diário.
+- Repor a aplicação através de uma opção na aba Início, com dupla confirmação; remove produtos e vendas, limpa o carrinho, repõe o limite de stock baixo e reinicia os IDs.
+- Mostrar um ecrã inicial de apresentação centrado no ecrã por 4 segundos antes de abrir a janela principal.
 - Configurar o limite de stock baixo e filtrar a lista de artigos por esse limite.
 - Ver indicadores: vendas de hoje, número de vendas, artigos, unidades em stock e artigos com stock baixo.
 - Guardar os dados localmente numa base de dados SQLite, separada dos ficheiros do programa.
@@ -60,3 +63,5 @@ O executável será criado em `dist\GerenciadorDeVendas.exe`.
 **Nota:** a primeira inicialização após esta alteração pode migrar a base de dados existente. Mantenha uma cópia de segurança antes de atualizar.
 
 No histórico, selecione uma venda para a anular ou apagar. Apagar remove permanentemente o registo e os seus artigos do histórico, sem repor nem alterar o stock. Para manter o registo e repor o stock, use a opção de anulação.
+
+O custo das mercadorias fica registado em cada venda para que os relatórios futuros não sejam alterados quando o custo do artigo for editado. Na primeira atualização com relatórios, os custos das vendas antigas são estimados com base no custo atual dos respetivos artigos.
