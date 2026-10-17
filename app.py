@@ -1572,7 +1572,7 @@ def show_splash_screen():
     )
     tk.Label(
         panel,
-        text="Desenvolvedor: Luiz Lobato Jr",
+        text="Engenheiro de Software: Luiz Lobato Jr",
         font=("TkDefaultFont", 10),
         foreground=COLOR_MUTED,
         background=COLOR_SURFACE,
