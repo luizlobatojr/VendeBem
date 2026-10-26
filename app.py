@@ -1,16 +1,28 @@
 import csv
+import hashlib
+import json
 import os
+import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
+from urllib.error import URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 APP_TITLE = "Gerenciador de Vendas"
+APP_VERSION = "1.0.0"
 DB_FILENAME = "gerenciador_vendas.db"
+GITHUB_REPOSITORY = "luizlobatojr/VendeBem"
+UPDATE_EXECUTABLE_NAME = "GerenciadorDeVendas.exe"
+MAX_UPDATE_SIZE = 200 * 1024 * 1024
 DEFAULT_WINDOW_WIDTH = 1120
 DEFAULT_WINDOW_HEIGHT = 720
 COLOR_PRIMARY = "#0284c7"
@@ -21,6 +33,10 @@ COLOR_MUTED = "#475569"
 COLOR_BORDER = "#e2e8f0"
 COLOR_WARNING = "#f59e0b"
 COLOR_DANGER = "#ef4444"
+
+
+class UpdateError(Exception):
+    pass
 
 
 def user_data_directory():
@@ -79,6 +95,126 @@ def database_path():
     return destination
 
 
+def version_tuple(version):
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", version)
+    if not match:
+        raise UpdateError(f"Versão inválida publicada no GitHub: {version}")
+    return tuple(int(part) for part in match.groups())
+
+
+def fetch_latest_release():
+    url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "VendeBem-Updater",
+        },
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            release = json.loads(response.read().decode("utf-8"))
+    except (URLError, TimeoutError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise UpdateError(f"Não foi possível consultar as Releases do GitHub.\n{exc}") from exc
+
+    if not isinstance(release, dict):
+        raise UpdateError("A resposta do GitHub para a Release é inválida.")
+    tag = release.get("tag_name")
+    if not isinstance(tag, str):
+        raise UpdateError("A Release mais recente não contém uma versão válida.")
+    version = tag.removeprefix("v")
+    version_tuple(version)
+
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        raise UpdateError("A Release mais recente não contém uma lista de ficheiros válida.")
+    asset = next(
+        (
+            item
+            for item in assets
+            if isinstance(item, dict) and item.get("name") == UPDATE_EXECUTABLE_NAME
+        ),
+        None,
+    )
+    if asset is None:
+        raise UpdateError(
+            f"A Release {tag} não contém o ficheiro {UPDATE_EXECUTABLE_NAME}."
+        )
+    download_url = asset.get("browser_download_url")
+    if not isinstance(download_url, str):
+        raise UpdateError("A Release não contém um endereço de download válido.")
+    parsed_url = urlparse(download_url or "")
+    expected_prefix = f"/{GITHUB_REPOSITORY}/releases/download/"
+    if (
+        parsed_url.scheme != "https"
+        or parsed_url.netloc != "github.com"
+        or not parsed_url.path.startswith(expected_prefix)
+    ):
+        raise UpdateError("O endereço do executável publicado não é confiável.")
+    size = asset.get("size")
+    if (
+        not isinstance(size, int)
+        or isinstance(size, bool)
+        or size <= 0
+        or size > MAX_UPDATE_SIZE
+    ):
+        raise UpdateError("O tamanho do executável publicado é inválido.")
+    digest = asset.get("digest")
+    if digest is not None and (
+        not isinstance(digest, str)
+        or not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest)
+    ):
+        raise UpdateError("O checksum publicado para o executável é inválido.")
+    return {
+        "version": version,
+        "tag": tag,
+        "url": download_url,
+        "size": size,
+        "digest": digest,
+    }
+
+
+def download_release_asset(release):
+    destination_directory = user_data_directory()
+    destination_directory.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=".vendebem-update-", suffix=".exe", dir=destination_directory
+    )
+    digest = hashlib.sha256()
+    downloaded = 0
+    try:
+        request = Request(
+            release["url"],
+            headers={"User-Agent": "VendeBem-Updater"},
+        )
+        with os.fdopen(descriptor, "wb") as destination, urlopen(
+            request, timeout=60
+        ) as response:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                downloaded += len(chunk)
+                if downloaded > release["size"] or downloaded > MAX_UPDATE_SIZE:
+                    raise UpdateError("O executável baixado excede o tamanho esperado.")
+                destination.write(chunk)
+                digest.update(chunk)
+        if downloaded != release["size"]:
+            raise UpdateError("O executável baixado está incompleto.")
+        expected_digest = release["digest"]
+        if expected_digest and digest.hexdigest().lower() != expected_digest[7:].lower():
+            raise UpdateError("A verificação de integridade do executável falhou.")
+        return Path(temporary_path)
+    except (URLError, TimeoutError, OSError) as exc:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+        raise UpdateError(f"Não foi possível baixar a atualização.\n{exc}") from exc
+    except UpdateError:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+        raise
+
+
 def money(value):
     return f"€ {float(value):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
@@ -105,6 +241,34 @@ def parse_price(value):
         raise ValueError("Introduza um valor numérico válido e não negativo.")
 
 
+def parse_quantity(value, allow_zero=False):
+    normalized = value.strip().lower().removesuffix("kg").strip().replace(",", ".")
+    try:
+        result = Decimal(normalized)
+    except (InvalidOperation, ValueError):
+        raise ValueError("Introduza uma quantidade válida em kg, por exemplo 1,500.")
+    if not result.is_finite() or result < 0 or (result == 0 and not allow_zero):
+        raise ValueError(
+            "A quantidade deve ser maior que zero." if not allow_zero
+            else "A quantidade não pode ser negativa."
+        )
+    try:
+        normalized_quantity = result.quantize(Decimal("0.001"))
+    except InvalidOperation:
+        raise ValueError("A quantidade introduzida é demasiado grande.")
+    if result != normalized_quantity:
+        raise ValueError("A quantidade pode ter no máximo três casas decimais (gramas).")
+    return result
+
+
+def format_quantity(value):
+    return f"{Decimal(str(value)):,.3f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def format_quantity_input(value):
+    return f"{float(value):.3f}"
+
+
 def calculate_discount(cart, percentage):
     try:
         rate = Decimal(str(percentage).strip().replace(",", "."))
@@ -113,7 +277,10 @@ def calculate_discount(cart, percentage):
     if not rate.is_finite() or rate < 0 or rate > 100:
         raise ValueError("O desconto deve ser um percentual entre 0 e 100.")
     subtotal = sum(
-        (Decimal(str(item["price"])) * item["quantity"] for item in cart.values()),
+        (
+            Decimal(str(item["price"])) * Decimal(str(item["quantity"]))
+            for item in cart.values()
+        ),
         Decimal("0")
     )
     discount = (subtotal * rate / Decimal("100")).quantize(
@@ -140,7 +307,7 @@ class Database:
                     category TEXT DEFAULT '',
                     cost REAL NOT NULL DEFAULT 0 CHECK(cost >= 0),
                     price REAL NOT NULL CHECK(price >= 0),
-                    stock INTEGER NOT NULL DEFAULT 0 CHECK(stock >= 0),
+                    stock REAL NOT NULL DEFAULT 0 CHECK(stock >= 0),
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS sales (
@@ -158,7 +325,7 @@ class Database:
                     sale_id INTEGER NOT NULL REFERENCES sales(id),
                     product_id INTEGER NOT NULL REFERENCES products(id),
                     product_name TEXT NOT NULL,
-                    quantity INTEGER NOT NULL CHECK(quantity > 0),
+                    quantity REAL NOT NULL CHECK(quantity > 0),
                     unit_price REAL NOT NULL,
                     unit_cost REAL NOT NULL DEFAULT 0,
                     subtotal REAL NOT NULL
@@ -201,19 +368,23 @@ class Database:
             "SELECT value FROM app_settings WHERE key='stock_alert_limit'"
         ).fetchone()
         try:
-            limit = int(row["value"])
+            limit = float(row["value"])
             return limit if limit >= 0 else 5
         except (TypeError, ValueError):
             return 5
 
     def set_stock_alert_limit(self, limit):
-        if not isinstance(limit, int) or limit < 0:
-            raise ValueError("O limite de stock deve ser um número inteiro não negativo.")
+        try:
+            decimal_limit = Decimal(str(limit))
+        except (InvalidOperation, ValueError):
+            raise ValueError("O limite de stock deve ser um número válido em kg.")
+        if not decimal_limit.is_finite() or decimal_limit < 0:
+            raise ValueError("O limite de stock deve ser um número não negativo.")
         with self.conn:
             self.conn.execute(
                 "INSERT INTO app_settings(key, value) VALUES ('stock_alert_limit', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (str(limit),)
+                (str(decimal_limit),)
             )
 
     def reset_data(self):
@@ -243,7 +414,7 @@ class Database:
             self.conn.execute("""
                 INSERT INTO products(name, code, category, cost, price, stock, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (name, code or None, category, cost, price, stock,
+            """, (name, code or None, category, cost, price, float(stock),
                   datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
 
     def update_product(self, product_id, name, code, category, cost, price, stock):
@@ -252,7 +423,7 @@ class Database:
                 UPDATE products
                 SET name=?, code=?, category=?, cost=?, price=?, stock=?
                 WHERE id=?
-            """, (name, code or None, category, cost, price, stock, product_id))
+            """, (name, code or None, category, cost, price, float(stock), product_id))
 
     def delete_product(self, product_id):
         used = self.conn.execute(
@@ -275,8 +446,12 @@ class Database:
                 ).fetchone()
                 if row is None:
                     raise ValueError("Um artigo da venda já não existe.")
-                if row["stock"] < item["quantity"]:
-                    raise ValueError(f"Stock insuficiente para {row['name']}. Disponível: {row['stock']}.")
+                quantity = Decimal(str(item["quantity"]))
+                if Decimal(str(row["stock"])) < quantity:
+                    raise ValueError(
+                        f"Stock insuficiente para {row['name']}. Disponível: "
+                        f"{format_quantity(row['stock'])} kg."
+                    )
                 product_costs[product_id] = row["cost"]
             cur = self.conn.execute(
                 """INSERT INTO sales(
@@ -287,18 +462,19 @@ class Database:
             )
             sale_id = cur.lastrowid
             for product_id, item in cart.items():
-                subtotal = item["quantity"] * item["price"]
+                quantity = Decimal(str(item["quantity"]))
+                subtotal = quantity * Decimal(str(item["price"]))
                 self.conn.execute("""
                     INSERT INTO sale_items(
                         sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    sale_id, product_id, item["name"], item["quantity"],
-                    item["price"], product_costs[product_id], subtotal
+                    sale_id, product_id, item["name"], float(quantity),
+                    item["price"], product_costs[product_id], float(subtotal)
                 ))
                 self.conn.execute(
-                    "UPDATE products SET stock=stock-? WHERE id=?",
-                    (item["quantity"], product_id)
+                    "UPDATE products SET stock=ROUND(stock-?, 3) WHERE id=?",
+                    (float(quantity), product_id)
                 )
         return sale_id, float(total)
 
@@ -319,7 +495,7 @@ class Database:
             ).fetchall()
             for item in items:
                 self.conn.execute(
-                    "UPDATE products SET stock=stock+? WHERE id=?",
+                    "UPDATE products SET stock=ROUND(stock+?, 3) WHERE id=?",
                     (item["quantity"], item["product_id"])
                 )
             canceled_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -635,8 +811,8 @@ class SalesApp(tk.Tk):
         self.metric_boxes = {}
         for key, title in [
             ("today", "Vendas de hoje"), ("sales", "Vendas registadas"),
-            ("products", "Artigos"), ("units", "Unidades em stock"),
-            ("low", f"Stock baixo (≤ {self.stock_alert_limit})"),
+            ("products", "Artigos"), ("units", "Stock total (kg)"),
+            ("low", f"Artigos com stock baixo (≤ {format_quantity(self.stock_alert_limit)} kg)"),
         ]:
             box = ttk.LabelFrame(self.metrics, text=title, padding=12)
             box.pack(side="left", fill="both", expand=True, padx=4)
@@ -681,6 +857,214 @@ class SalesApp(tk.Tk):
             command=self.reset_application,
         ).pack(side="right")
 
+        updates = ttk.LabelFrame(
+            self.home_tab, text="Atualizações", padding=(12, 10)
+        )
+        updates.pack(fill="x", pady=(14, 0))
+        ttk.Label(
+            updates,
+            text=(
+                f"Versão instalada: v{APP_VERSION}. Os dados em "
+                f"{user_data_directory()} não são alterados pela atualização."
+            ),
+            style="ReportDetail.TLabel",
+            wraplength=850,
+        ).pack(anchor="w")
+        update_actions = ttk.Frame(updates)
+        update_actions.pack(fill="x", pady=(8, 0))
+        self.update_status = tk.StringVar(value="Pronto para verificar.")
+        ttk.Label(
+            update_actions, textvariable=self.update_status, style="ReportDetail.TLabel"
+        ).pack(side="left", fill="x", expand=True)
+        self.update_button = ttk.Button(
+            update_actions,
+            text="Verificar e atualizar programa",
+            command=self.check_for_updates,
+        )
+        self.update_button.pack(side="right")
+
+    def check_for_updates(self):
+        if sys.platform != "win32" or not getattr(sys, "frozen", False):
+            messagebox.showinfo(
+                "Atualização automática",
+                "A atualização automática está disponível apenas no executável "
+                "do Windows instalado.",
+                parent=self,
+            )
+            return
+        self.update_button.configure(state="disabled")
+        self.update_status.set("A verificar a versão mais recente…")
+        threading.Thread(target=self._check_for_updates_worker, daemon=True).start()
+
+    def _check_for_updates_worker(self):
+        try:
+            release = fetch_latest_release()
+        except UpdateError as exc:
+            self.after(0, lambda: self._update_failed(str(exc)))
+            return
+        self.after(0, lambda: self._handle_latest_release(release))
+
+    def _handle_latest_release(self, release):
+        latest_version = release["version"]
+        current_version = version_tuple(APP_VERSION)
+        parsed_latest_version = version_tuple(latest_version)
+        if parsed_latest_version == current_version:
+            self.update_status.set(f"Está na versão mais recente: v{APP_VERSION}.")
+            self.update_button.configure(state="normal")
+            messagebox.showinfo(
+                "Programa atualizado",
+                f"Já está a utilizar a versão mais recente (v{APP_VERSION}).",
+                parent=self,
+            )
+            return
+        if parsed_latest_version < current_version:
+            self.update_status.set(
+                f"A versão instalada (v{APP_VERSION}) é mais recente que a Release."
+            )
+            self.update_button.configure(state="normal")
+            messagebox.showinfo(
+                "Programa atualizado",
+                f"A versão instalada (v{APP_VERSION}) é mais recente que a Release "
+                f"v{latest_version}.",
+                parent=self,
+            )
+            return
+
+        self.update_status.set(f"Nova versão disponível: v{latest_version}.")
+        if not messagebox.askyesno(
+            "Atualização disponível",
+            f"Está disponível a versão v{latest_version}.\n\n"
+            "O executável será substituído e o programa reiniciado. "
+            "A base de dados, as configurações e o histórico em "
+            f"{user_data_directory()} serão mantidos.\n\n"
+            "Pretende baixar e instalar agora?",
+            parent=self,
+        ):
+            self.update_button.configure(state="normal")
+            self.update_status.set("Atualização cancelada.")
+            return
+
+        self.update_status.set(f"A baixar a versão v{latest_version}…")
+        threading.Thread(
+            target=self._download_update_worker,
+            args=(release,),
+            daemon=True,
+        ).start()
+
+    def _download_update_worker(self, release):
+        try:
+            downloaded_path = download_release_asset(release)
+        except UpdateError as exc:
+            self.after(0, lambda: self._update_failed(str(exc)))
+            return
+        self.after(
+            0,
+            lambda: self._start_update(downloaded_path, release["version"]),
+        )
+
+    def _start_update(self, downloaded_path, version):
+        if self.cart and not messagebox.askyesno(
+            "Carrinho com artigos pendentes",
+            "O carrinho atual não será guardado durante a atualização. "
+            "Pretende fechar a aplicação e continuar?",
+            parent=self,
+        ):
+            downloaded_path.unlink(missing_ok=True)
+            self.update_button.configure(state="normal")
+            self.update_status.set("Atualização cancelada.")
+            return
+
+        target_path = Path(sys.executable).resolve()
+        script_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                suffix=".ps1",
+                prefix=".vendebem-updater-",
+                dir=user_data_directory(),
+                delete=False,
+            ) as script:
+                script.write(
+                    """param([int]$ProcessId, [string]$Target, [string]$Downloaded)
+                    $staged = Join-Path (Split-Path -Parent $Target) ([IO.Path]::GetRandomFileName())
+                    $backup = "$staged.backup"
+                    $deadline = (Get-Date).AddSeconds(120)
+while ((Get-Date) -lt $deadline) {
+    if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep -Milliseconds 500
+}
+if (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        [System.Windows.Forms.MessageBox]::Show(
+            "A atualização não foi instalada porque o programa continuou aberto.",
+            "Falha na atualização"
+        ) | Out-Null
+    } catch {}
+    Remove-Item -LiteralPath $Downloaded -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+    exit 1
+}
+try {
+    Copy-Item -LiteralPath $Downloaded -Destination $staged -ErrorAction Stop
+    [IO.File]::Replace($staged, $Target, $backup)
+    Start-Process -FilePath $Target -ErrorAction Stop
+} catch {
+    if (Test-Path -LiteralPath $backup) {
+        Copy-Item -LiteralPath $backup -Destination $Target -Force -ErrorAction SilentlyContinue
+    }
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        [System.Windows.Forms.MessageBox]::Show(
+            "Não foi possível substituir ou iniciar o executável. Verifique as permissões da pasta de instalação.`n`n$($_.Exception.Message)",
+            "Falha na atualização"
+        ) | Out-Null
+    } catch {}
+} finally {
+    Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $Downloaded -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+}
+"""
+                )
+                script_path = Path(script.name)
+            subprocess.Popen(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(script_path),
+                    str(os.getpid()),
+                    str(target_path),
+                    str(downloaded_path),
+                ],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except OSError as exc:
+            downloaded_path.unlink(missing_ok=True)
+            if script_path:
+                script_path.unlink(missing_ok=True)
+            self._update_failed(f"Não foi possível iniciar a instalação.\n{exc}")
+            return
+
+        self.update_status.set(f"A instalar a versão v{version}…")
+        self.db.close()
+        self.destroy()
+
+    def _update_failed(self, error):
+        self.update_button.configure(state="normal")
+        self.update_status.set("Não foi possível concluir a atualização.")
+        messagebox.showerror(
+            "Falha na atualização",
+            error,
+            parent=self,
+        )
+
     def _on_tab_changed(self, _event=None):
         if self.tabs.select() == str(self.home_tab):
             self.refresh_metrics()
@@ -699,8 +1083,8 @@ class SalesApp(tk.Tk):
         self.p_stock = tk.StringVar(value="0")
         fields = [
             ("Nome *", self.p_name, 0, 0), ("Código/SKU", self.p_code, 0, 2),
-            ("Categoria", self.p_category, 0, 4), ("Custo (€)", self.p_cost, 1, 0),
-            ("Preço de venda (€) *", self.p_price, 1, 2), ("Quantidade em stock *", self.p_stock, 1, 4)
+            ("Categoria", self.p_category, 0, 4), ("Custo por kg (€)", self.p_cost, 1, 0),
+            ("Preço por kg (€) *", self.p_price, 1, 2), ("Stock (kg) *", self.p_stock, 1, 4)
         ]
         for label, var, row, col in fields:
             ttk.Label(form, text=label).grid(row=row*2, column=col, sticky="w", padx=5, pady=(3, 0))
@@ -726,20 +1110,23 @@ class SalesApp(tk.Tk):
             searchbar, text="Só stock baixo (≤)", variable=self.low_stock_only,
             command=self.refresh_products
         ).pack(side="left", padx=(12, 4))
-        self.stock_limit_var = tk.StringVar(value=str(self.stock_alert_limit))
+        self.stock_limit_var = tk.StringVar(
+            value=format_quantity_input(self.stock_alert_limit)
+        )
         stock_limit_input = ttk.Spinbox(
-            searchbar, from_=0, to=999999, increment=1, width=7,
+            searchbar, from_=0, to=999999, increment=0.1, width=7,
             textvariable=self.stock_limit_var, command=self.save_stock_alert_limit
         )
         stock_limit_input.pack(side="left")
+        ttk.Label(searchbar, text="kg").pack(side="left", padx=(4, 0))
         stock_limit_input.bind("<Return>", self.save_stock_alert_limit)
         stock_limit_input.bind("<FocusOut>", self.save_stock_alert_limit)
 
         cols = ("id", "name", "code", "category", "cost", "price", "stock")
         self.product_tree = ttk.Treeview(tab, columns=cols, show="headings", selectmode="browse")
         headings = {"id":"ID", "name":"Mercadoria", "code":"Código", "category":"Categoria",
-                    "cost":"Custo", "price":"Preço venda", "stock":"Stock"}
-        widths = {"id":50, "name":250, "code":120, "category":150, "cost":100, "price":110, "stock":80}
+                    "cost":"Custo/kg", "price":"Preço/kg", "stock":"Stock (kg)"}
+        widths = {"id":50, "name":250, "code":120, "category":150, "cost":100, "price":110, "stock":100}
         for c in cols:
             self.product_tree.heading(c, text=headings[c])
             self.product_tree.column(c, width=widths[c], anchor="w" if c in ("name","code","category") else "center")
@@ -757,16 +1144,16 @@ class SalesApp(tk.Tk):
         self.sale_product = tk.StringVar()
         self.sale_combo = ttk.Combobox(top, textvariable=self.sale_product, state="readonly", width=55)
         self.sale_combo.grid(row=0, column=1, padx=8, sticky="ew")
-        ttk.Label(top, text="Quantidade:").grid(row=0, column=2, padx=(12, 0))
-        self.sale_qty = tk.StringVar(value="1")
+        ttk.Label(top, text="Quantidade (kg):").grid(row=0, column=2, padx=(12, 0))
+        self.sale_qty = tk.StringVar(value="1,000")
         ttk.Entry(top, textvariable=self.sale_qty, width=8).grid(row=0, column=3, padx=8)
         ttk.Button(top, text="Adicionar", command=self.add_to_cart).grid(row=0, column=4, padx=4)
         top.columnconfigure(1, weight=1)
 
         self.cart_tree = ttk.Treeview(tab, columns=("name","quantity","price","subtotal"), show="headings", height=12)
         for c, title, width in [
-            ("name","Mercadoria",400), ("quantity","Quantidade",120),
-            ("price","Preço unitário",150), ("subtotal","Subtotal",150)
+            ("name","Mercadoria",400), ("quantity","Quantidade (kg)",120),
+            ("price","Preço/kg",150), ("subtotal","Subtotal",150)
         ]:
             self.cart_tree.heading(c, text=title)
             self.cart_tree.column(c, width=width, anchor="w" if c == "name" else "center")
@@ -796,7 +1183,7 @@ class SalesApp(tk.Tk):
         self.cart_discount_label.pack(side="right", padx=8)
         self.cart_total_label = ttk.Label(totals, text="TOTAL: € 0,00", style="Title.TLabel")
         self.cart_total_label.pack(side="right", padx=8)
-        ttk.Label(tab, text="O stock é reduzido automaticamente quando a venda é finalizada.",
+        ttk.Label(tab, text="O valor é calculado por kg e o stock em kg é reduzido automaticamente ao finalizar a venda.",
                   foreground="#555").pack(anchor="w", pady=(4, 0))
 
     def _build_history_tab(self):
@@ -841,7 +1228,7 @@ class SalesApp(tk.Tk):
         )
         for c, title, width in [
             ("id","N.º venda",90), ("date","Data e hora",220), ("total","Total",130),
-            ("payment","Pagamento",150), ("units","Unidades",100), ("status","Estado",100)
+            ("payment","Pagamento",150), ("units","Total (kg)",100), ("status","Estado",100)
         ]:
             self.history_tree.heading(c, text=title)
             self.history_tree.column(c, width=width, anchor="center")
@@ -1026,7 +1413,7 @@ class SalesApp(tk.Tk):
         if top_product:
             product_text = (
                 f"Artigo mais vendido: {top_product['product_name']} "
-                f"({top_product['quantity']} un.)"
+                f"({format_quantity(top_product['quantity'])} kg)"
             )
         else:
             product_text = "Artigo mais vendido: —"
@@ -1100,7 +1487,7 @@ class SalesApp(tk.Tk):
         if not path:
             return
         columns = (
-            "Venda", "Data e hora", "Estado", "Pagamento", "Artigos", "Unidades",
+            "Venda", "Data e hora", "Estado", "Pagamento", "Artigos", "Quantidade total (kg)",
             "Subtotal", "Desconto (%)", "Valor do desconto", "Total", "Motivo da anulação"
         )
         try:
@@ -1110,7 +1497,8 @@ class SalesApp(tk.Tk):
                 for row in rows:
                     items = self.db.sale_items(row["id"])
                     article_list = " | ".join(
-                        f'{item["product_name"]} x {item["quantity"]}' for item in items
+                        f'{item["product_name"]} x {format_quantity(item["quantity"])} kg'
+                        for item in items
                     )
                     writer.writerow({
                         "Venda": row["id"],
@@ -1118,7 +1506,7 @@ class SalesApp(tk.Tk):
                         "Estado": "Anulada" if row["canceled_at"] else "Concluída",
                         "Pagamento": row["payment_method"],
                         "Artigos": article_list,
-                        "Unidades": row["units"],
+                        "Quantidade total (kg)": format_quantity(row["units"]),
                         "Subtotal": f'{row["subtotal"]:.2f}'.replace(".", ","),
                         "Desconto (%)": f'{row["discount_percent"]:.2f}'.replace(".", ","),
                         "Valor do desconto": f'{row["discount_amount"]:.2f}'.replace(".", ","),
@@ -1140,11 +1528,9 @@ class SalesApp(tk.Tk):
         try:
             cost = parse_price(self.p_cost.get())
             price = parse_price(self.p_price.get())
-            stock = int(self.p_stock.get().strip())
-            if stock < 0:
-                raise ValueError("A quantidade em stock não pode ser negativa.")
+            stock = parse_quantity(self.p_stock.get(), allow_zero=True)
         except ValueError as exc:
-            messagebox.showerror("Dados inválidos", str(exc) if str(exc) else "A quantidade deve ser um número inteiro.")
+            messagebox.showerror("Dados inválidos", str(exc) or "Verifique os valores introduzidos.")
             return
         try:
             if self.selected_product_id is None:
@@ -1183,7 +1569,7 @@ class SalesApp(tk.Tk):
             self.p_category.set(row["category"] or "")
             self.p_cost.set(str(row["cost"]).replace(".", ","))
             self.p_price.set(str(row["price"]).replace(".", ","))
-            self.p_stock.set(str(row["stock"]))
+            self.p_stock.set(format_quantity(row["stock"]))
 
     def delete_product(self):
         if self.selected_product_id is None:
@@ -1205,19 +1591,21 @@ class SalesApp(tk.Tk):
             return
         product_id = self.sale_product_ids[chosen]
         try:
-            qty = int(self.sale_qty.get().strip())
-            if qty <= 0:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Quantidade inválida", "A quantidade deve ser um número inteiro maior que zero.")
+            qty = parse_quantity(self.sale_qty.get())
+        except ValueError as exc:
+            messagebox.showerror("Quantidade inválida", str(exc))
             return
         row = self.db.conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
         if not row:
             messagebox.showerror("Erro", "A mercadoria já não existe.")
             return
         current_qty = self.cart.get(product_id, {}).get("quantity", 0)
-        if current_qty + qty > row["stock"]:
-            messagebox.showerror("Stock insuficiente", f"Disponível: {row['stock']} unidade(s). Já adicionadas ao carrinho: {current_qty}.")
+        if Decimal(str(current_qty)) + qty > Decimal(str(row["stock"])):
+            messagebox.showerror(
+                "Stock insuficiente",
+                f"Disponível: {format_quantity(row['stock'])} kg. "
+                f"Já adicionados ao carrinho: {format_quantity(current_qty)} kg.",
+            )
             return
         if product_id not in self.cart:
             self.cart[product_id] = {"name": row["name"], "price": row["price"], "quantity": qty}
@@ -1247,20 +1635,27 @@ class SalesApp(tk.Tk):
         if item is None or row is None:
             messagebox.showerror("Artigo indisponível", "Atualize o carrinho: este artigo já não existe.")
             return
-        if row["stock"] < 1:
-            messagebox.showerror("Stock insuficiente", "Este artigo já não tem unidades disponíveis.")
+        if row["stock"] <= 0:
+            messagebox.showerror("Stock insuficiente", "Este artigo já não tem stock disponível.")
             return
-        quantity = simpledialog.askinteger(
-            "Editar quantidade", f'Nova quantidade para {row["name"]} (stock: {row["stock"]}):',
-            initialvalue=min(item["quantity"], row["stock"]), minvalue=1,
-            maxvalue=row["stock"], parent=self
+        quantity_text = simpledialog.askstring(
+            "Editar quantidade",
+            f'Nova quantidade em kg para {row["name"]} '
+            f'(stock: {format_quantity(row["stock"])} kg):',
+            initialvalue=format_quantity(min(item["quantity"], row["stock"])),
+            parent=self,
         )
-        if quantity is None:
+        if quantity_text is None:
+            return
+        try:
+            quantity = parse_quantity(quantity_text)
+        except ValueError as exc:
+            messagebox.showerror("Quantidade inválida", str(exc))
             return
         latest = self.db.conn.execute(
             "SELECT stock FROM products WHERE id=?", (product_id,)
         ).fetchone()
-        if latest is None or quantity > latest["stock"]:
+        if latest is None or quantity > Decimal(str(latest["stock"])):
             messagebox.showerror("Stock insuficiente", "O stock mudou. Atualize a quantidade e tente novamente.")
             return
         item["quantity"] = quantity
@@ -1269,9 +1664,11 @@ class SalesApp(tk.Tk):
     def refresh_cart(self):
         self.cart_tree.delete(*self.cart_tree.get_children())
         for product_id, item in self.cart.items():
-            subtotal = item["quantity"] * item["price"]
+            quantity = Decimal(str(item["quantity"]))
+            subtotal = quantity * Decimal(str(item["price"]))
             self.cart_tree.insert("", "end", values=(
-                item["name"], item["quantity"], money(item["price"]), money(subtotal)
+                item["name"], f"{format_quantity(quantity)} kg",
+                f"{money(item['price'])}/kg", money(subtotal)
             ), tags=(str(product_id),))
         self.refresh_cart_totals()
 
@@ -1280,7 +1677,10 @@ class SalesApp(tk.Tk):
             subtotal, discount, total = calculate_discount(self.cart, self.discount_percent.get())
         except ValueError:
             subtotal = sum(
-                (Decimal(str(item["price"])) * item["quantity"] for item in self.cart.values()),
+                (
+                    Decimal(str(item["price"])) * Decimal(str(item["quantity"]))
+                    for item in self.cart.values()
+                ),
                 Decimal("0")
             )
             self.cart_subtotal_label.configure(text=f"Subtotal: {money(subtotal)}")
@@ -1327,28 +1727,35 @@ class SalesApp(tk.Tk):
         for row in rows:
             self.product_tree.insert("", "end", values=(
                 row["id"], row["name"], row["code"] or "", row["category"] or "",
-                money(row["cost"]), money(row["price"]), row["stock"]
+                money(row["cost"]), money(row["price"]),
+                f"{format_quantity(row['stock'])} kg"
             ), tags=("low_stock",) if row["stock"] <= self.stock_alert_limit else ())
         self.sale_product_ids = []
         choices = []
         for row in self.db.products():
             if row["stock"] > 0:
                 self.sale_product_ids.append(row["id"])
-                choices.append(f'{row["name"]} | Stock: {row["stock"]} | {money(row["price"])}')
+                choices.append(
+                    f'{row["name"]} | Stock: {format_quantity(row["stock"])} kg | '
+                    f'{money(row["price"])}/kg'
+                )
         self.sale_combo["values"] = choices
         if self.sale_combo.current() >= len(choices):
             self.sale_combo.set("")
 
     def save_stock_alert_limit(self, _event=None):
         try:
-            limit = int(self.stock_limit_var.get().strip())
-            self.db.set_stock_alert_limit(limit)
+            limit = parse_quantity(self.stock_limit_var.get(), allow_zero=True)
+            self.db.set_stock_alert_limit(float(limit))
         except ValueError as exc:
             messagebox.showerror("Limite inválido", str(exc))
-            self.stock_limit_var.set(str(self.stock_alert_limit))
+            self.stock_limit_var.set(format_quantity_input(self.stock_alert_limit))
             return
-        self.stock_alert_limit = limit
-        self.metric_boxes["low"].configure(text=f"Stock baixo (≤ {limit})")
+        self.stock_alert_limit = float(limit)
+        self.stock_limit_var.set(format_quantity_input(limit))
+        self.metric_boxes["low"].configure(
+            text=f"Artigos com stock baixo (≤ {format_quantity(limit)} kg)"
+        )
         self.refresh_products()
         self.refresh_metrics()
 
@@ -1357,7 +1764,8 @@ class SalesApp(tk.Tk):
         for row in self.db.sales(**self.active_history_filters):
             self.history_tree.insert("", "end", values=(
                 row["id"], row["sold_at"], money(row["total"]), row["payment_method"],
-                row["units"], "Anulada" if row["canceled_at"] else "Concluída"
+                f"{format_quantity(row['units'])} kg",
+                "Anulada" if row["canceled_at"] else "Concluída"
             ), tags=("canceled",) if row["canceled_at"] else ())
         self._update_cancel_button_state()
 
@@ -1436,15 +1844,16 @@ class SalesApp(tk.Tk):
         ttk.Label(win, text=status_text, wraplength=620).pack(anchor="w", padx=12, pady=(0, 10))
         tree = ttk.Treeview(win, columns=("name","qty","price","subtotal"), show="headings")
         for c, title, width in [
-            ("name","Mercadoria",280), ("qty","Quantidade",90),
-            ("price","Preço unitário",120), ("subtotal","Subtotal",120)
+            ("name","Mercadoria",280), ("qty","Quantidade (kg)",110),
+            ("price","Preço/kg",120), ("subtotal","Subtotal",120)
         ]:
             tree.heading(c, text=title)
             tree.column(c, width=width, anchor="w" if c == "name" else "center")
         tree.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         for item in items:
             tree.insert("", "end", values=(
-                item["product_name"], item["quantity"], money(item["unit_price"]), money(item["subtotal"])
+                item["product_name"], f"{format_quantity(item['quantity'])} kg",
+                f"{money(item['unit_price'])}/kg", money(item["subtotal"])
             ))
         subtotal = sum(item["subtotal"] for item in items)
         ttk.Label(
@@ -1459,7 +1868,7 @@ class SalesApp(tk.Tk):
         self.metric_labels["today"].configure(text=money(today))
         self.metric_labels["sales"].configure(text=str(sales))
         self.metric_labels["products"].configure(text=str(products))
-        self.metric_labels["units"].configure(text=str(units))
+        self.metric_labels["units"].configure(text=f"{format_quantity(units)} kg")
         self.metric_labels["low"].configure(text=str(low))
         self.metric_labels["low"].configure(
             foreground=COLOR_WARNING if low else COLOR_TEXT
@@ -1511,8 +1920,10 @@ class SalesApp(tk.Tk):
         self.product_search.set("")
         self.low_stock_only.set(False)
         self.stock_alert_limit = 5
-        self.stock_limit_var.set("5")
-        self.metric_boxes["low"].configure(text="Stock baixo (≤ 5)")
+        self.stock_limit_var.set("5.000")
+        self.metric_boxes["low"].configure(
+            text="Artigos com stock baixo (≤ 5,000 kg)"
+        )
         self.active_history_filters = {
             "search": "",
             "date_from": "",
@@ -1533,10 +1944,14 @@ class SalesApp(tk.Tk):
     def on_close(self):
         if self.cart:
             item_count = len(self.cart)
-            unit_count = sum(item["quantity"] for item in self.cart.values())
+            quantity = sum(
+                (Decimal(str(item["quantity"])) for item in self.cart.values()),
+                Decimal("0"),
+            )
             if not messagebox.askyesno(
                 "Carrinho com artigos pendentes",
-                f"O carrinho contém {item_count} artigo(s), num total de {unit_count} unidade(s), "
+                f"O carrinho contém {item_count} artigo(s), num total de "
+                f"{format_quantity(quantity)} kg, "
                 "que não foram registados.\n\nPretende fechar a aplicação e perder estes dados?",
                 parent=self,
             ):
